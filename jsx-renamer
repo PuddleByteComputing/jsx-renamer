@@ -1,0 +1,188 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Renames files JSX files with .js extensions to .jsx, and fixes
+# relative imports of those files.
+
+# Caveats:
+# 1. Does not attempt to deal with absolute imports. (TODO)
+# 2. No warantee, not fit for any specific purpose, might
+#    frighten household pets, etc.
+
+# Assumptions:
+# This is tailored for a Rails project using git for source control
+#   that uses yarn, and has eslint installed via yarn and configured
+#   via .eslintrc.  It also expects to find `ag` (the silver searcher)
+#   installed on your system.
+# Adjust as necessary.
+
+# Usage:
+# 1. enable the react/jsx-filename-extension rule in your .eslintrc
+#    if you are not ready to do this globally, add a .eslintrc file
+#    in the root director(ies) where you want to enforce the .jsx
+#    extension rule, containting the following:
+#    {
+#      'rules': {
+#        'react/jsx-filename-extension': [1, { 'extensions': ['.jsx'] }],
+#      }
+#    }
+# 2. run this script in the root of your project and inspect the output.
+# 3. make changes to the script if things look wrong.
+# 4. change `DRY_RUN = true` on line 41 to `DRY_RUN = false`
+# 5. run the script again
+# 6. test your app
+# 7. manually adjust anything the script missed
+# 8. git commit
+
+require 'shellwords'
+require 'json'
+
+class JsxRenamer
+  DRY_RUN = true
+  ESLINT = 'yarn --non-interactive -s run eslint'
+  JAVASCRIPT_DIRS = ['app/assets/javascripts'].freeze
+
+  def initialize(argv = nil)
+    abort usage unless argv && argv.any?
+    @argv = argv
+    @pwd = Dir.pwd
+    abort 'Not in project root.' unless File.directory?("#{@pwd}/.git")
+    @errors = []
+  end
+
+  def run
+    jsx_extension_violators.each do |jev|
+      file = jev[:filePath]
+      rename(file)
+      if file.match?(%r{/index\.js$})
+        rewrite_test_index_references(file)
+        rewrite_referencing_files(file, true)
+      elsif file.match?(/\.test\.js$/)
+        # * file probably not referenced anywhere, don't try to fix references
+      else
+        rewrite_referencing_files(file)
+      end
+    end
+    STDERR.puts("\n#{@errors.join("\n")}") if @errors.any?
+  end
+
+  private
+
+  def eslint_json
+    extra_args = '--ext js --no-color -f json'
+    @eslint_json ||= `#{ESLINT} #{extra_args} #{@argv.join(' ')} 2>/dev/null`
+  end
+
+  def jsx_extension_violators
+    @jsx_extension_violators ||=
+      JSON.parse(eslint_json, symbolize_names: true)
+          .select { |h| h[:errorCount].positive? || h[:warningCount].positive? }
+          .select { |h| h[:messages].any? { |m| m[:ruleId] == 'react/jsx-filename-extension' } }
+  end
+
+  def usage
+    "Usage:\n  #{$PROGRAM_NAME} path [path...]"
+  end
+
+  def rename(file)
+    if DRY_RUN
+      puts "would move: #{shorter(file)}  ->  #{shorter(renamed(file))}"
+    else
+      system("git mv #{file} #{renamed(file)}")
+    end
+  end
+
+  def shorter(file)
+    file.sub(@pwd, '').sub(%r{^/}, '')
+  end
+
+  def renamed(file)
+    file.sub(/js$/, 'jsx')
+  end
+
+  def file_regex(file, with_index = false)
+    regex = File.basename(file).sub(/\.jsx?$/, '')
+    regex = "#{File.dirname(file).split('/').last}\/index" if with_index
+    "\/#{regex}(\.jsx?)?"
+  end
+
+  # tests involving /index.js(x) files are a special case;
+  #   the imports can't be detected the way we do it in rewrite_referencing_files
+  def rewrite_test_index_references(file)
+    test_dir = "#{File.dirname(file)}/tests".sub("#{@pwd}/", '')
+    return unless File.directory?(test_dir)
+    test_files = Dir.glob("#{test_dir}/*")
+    test_files.each do |test_file|
+      lines = File.new(test_file).readlines
+      rewrite = false
+      lines.map! do |line|
+        if line.match?('from.*\.\./index(\.js)?')
+          new_line = line.sub(%r{\.\./index(\.js)?}, '../')
+          rewrite ||= (new_line != line)
+          puts "would rewrite:\n      #{line}  as: #{new_line}" if DRY_RUN && (new_line != line)
+          new_line
+        else
+          line
+        end
+      end
+      if rewrite
+        if DRY_RUN
+          puts "  in: #{test_file}"
+        else
+          File.open(test_file, 'w+') { |f| f.puts(lines) }
+          system("git add #{test_file}")
+        end
+      end
+    end
+  end
+
+  def rewrite_referencing_files(file, with_index = false)
+    matching_files = `ag -l 'from.*#{file_regex(file, with_index)}' #{JAVASCRIPT_DIRS.join(' ')}`
+                     .split("\n")
+    referencing_files = matching_files
+    if referencing_files.any?
+      corrected_name = File.basename(file).sub(/\.jsx?$/, '')
+      corrected_name = File.dirname(file).split('/').last if with_index
+      referencing_files.each do |referencing_file|
+        rewrite_referencing_file(file, referencing_file, corrected_name, with_index)
+      end
+    else
+      @errors << "ALERT: no references found to #{file}\n  is this dead code?" unless referencing_files.any?
+    end
+  end
+
+  def rewrite_referencing_file(file, referencing_file, corrected_name, with_index = false)
+    lines = File.new(referencing_file).readlines
+    rewrite = false
+    lines.map! do |line|
+      m = line.match(/from.*['"](?<reference>[^'"]*#{file_regex(file, with_index)})['"]/)
+      if m.nil?
+        line
+      else
+        referencing_dir = File.dirname(referencing_file)
+        reference = m[:reference]
+        reference += '.js' unless reference.match?(/\.js$/)
+        target = File.absolute_path("#{referencing_dir}/#{reference}")
+        if file == target
+          new_line = line.sub(/#{file_regex(file, with_index)}/, "/#{corrected_name}")
+          rewrite ||= (new_line != line)
+          puts "would rewrite:\n      #{line}  as: #{new_line}" if DRY_RUN && (new_line != line)
+          new_line
+        else
+          line
+        end
+      end
+    end
+
+    return unless rewrite
+
+    if DRY_RUN
+      puts "  in: #{referencing_file}"
+    else
+      File.open(referencing_file, 'w') { |f| f.puts(lines) }
+      system("git add #{referencing_file}")
+    end
+  end
+end
+
+JsxRenamer.new(ARGV).run
